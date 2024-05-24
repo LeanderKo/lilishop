@@ -40,8 +40,12 @@ import cn.lili.modules.store.entity.dto.StoreDeliverGoodsAddressDTO;
 import cn.lili.modules.store.service.StoreDetailService;
 import cn.lili.modules.system.aspect.annotation.SystemLogPoint;
 import cn.lili.modules.system.entity.dos.Logistics;
+import cn.lili.modules.system.entity.dos.Setting;
+import cn.lili.modules.system.entity.dto.OrderSetting;
+import cn.lili.modules.system.entity.enums.SettingEnum;
 import cn.lili.modules.system.entity.vo.Traces;
 import cn.lili.modules.system.service.LogisticsService;
+import cn.lili.modules.system.service.SettingService;
 import cn.lili.mybatis.util.PageUtil;
 import cn.lili.rocketmq.RocketmqSendCallbackBuilder;
 import cn.lili.rocketmq.tags.GoodsTagsEnum;
@@ -153,6 +157,9 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
      */
     @Autowired
     private OrderPackageItemService orderPackageItemService;
+
+    @Autowired
+    private SettingService settingService;
 
     @Override
     @Transactional(rollbackFor = Exception.class)
@@ -303,7 +310,8 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         Order order = OperationalJudgment.judgment(this.getBySn(orderSn));
         //如果订单促销类型不为空&&订单是拼团订单，并且订单未成团，则抛出异常
         if (OrderPromotionTypeEnum.PINTUAN.name().equals(order.getOrderPromotionType())
-                && !CharSequenceUtil.equalsAny(order.getOrderStatus(), OrderStatusEnum.TAKE.name(), OrderStatusEnum.UNDELIVERED.name(), OrderStatusEnum.STAY_PICKED_UP.name())) {
+            && !CharSequenceUtil.equalsAny(order.getOrderStatus(), OrderStatusEnum.TAKE.name(), OrderStatusEnum.UNDELIVERED.name(),
+                OrderStatusEnum.STAY_PICKED_UP.name())) {
             throw new ServiceException(ResultCode.ORDER_CAN_NOT_CANCEL);
         }
         if (CharSequenceUtil.equalsAny(order.getOrderStatus(),
@@ -330,12 +338,12 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
     @Override
     @OrderLogPoint(description = "'订单['+#orderSn+']系统取消，原因为：'+#reason", orderSn = "#orderSn")
     @Transactional(rollbackFor = Exception.class)
-    public void systemCancel(String orderSn, String reason,Boolean refundMoney) {
+    public void systemCancel(String orderSn, String reason, Boolean refundMoney) {
         Order order = this.getBySn(orderSn);
         order.setOrderStatus(OrderStatusEnum.CANCELLED.name());
         order.setCancelReason(reason);
         this.updateById(order);
-        if(refundMoney){
+        if (refundMoney) {
             //生成店铺退款流水
             this.generatorStoreRefundFlow(order);
             orderStatusMessage(order);
@@ -526,10 +534,14 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
     @Override
     public Order getOrderByVerificationCode(String verificationCode) {
         String storeId = Objects.requireNonNull(UserContext.getCurrentUser()).getStoreId();
-        return this.getOne(new LambdaQueryWrapper<Order>()
+        Order order = this.getOne(new LambdaQueryWrapper<Order>()
                 .in(Order::getOrderStatus, OrderStatusEnum.TAKE.name(), OrderStatusEnum.STAY_PICKED_UP.name())
                 .eq(Order::getStoreId, storeId)
                 .eq(Order::getVerificationCode, verificationCode));
+        if (order == null) {
+            throw new ServiceException(ResultCode.ORDER_TAKE_ERROR);
+        }
+        return order;
     }
 
     @Override
@@ -558,11 +570,14 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
     @Transactional(rollbackFor = Exception.class)
     public void complete(Order order, String orderSn) {//修改订单状态为完成
         this.updateStatus(orderSn, OrderStatusEnum.COMPLETED);
-
         //修改订单货物可以进行评价
         orderItemService.update(new UpdateWrapper<OrderItem>().eq(ORDER_SN_COLUMN, orderSn)
                 .set("comment_status", CommentStatusEnum.UNFINISHED));
         this.update(new LambdaUpdateWrapper<Order>().eq(Order::getSn, orderSn).set(Order::getCompleteTime, new Date()));
+
+        //修改订单投诉状态
+        updateOrderComplainStatus(orderSn);
+
         //发送订单状态改变消息
         OrderMessage orderMessage = new OrderMessage();
         orderMessage.setNewStatus(OrderStatusEnum.COMPLETED);
@@ -646,7 +661,7 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
             this.pintuanOrderSuccess(list);
         } else if (Boolean.FALSE.equals(pintuan.getFictitious()) && pintuan.getRequiredNum() > list.size()) {
             //如果未开启虚拟成团且当前订单数量不足成团数量，则认为拼团失败
-            this.pintuanOrderFailed(list);
+            this.pintuanOrderFailed(parentOrderSn);
         }
     }
 
@@ -719,7 +734,7 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         Trade trade = tradeService.getBySn(order.getTradeSn());
         //如果交易不为空，则返回交易的金额，否则返回订单金额
         if (CharSequenceUtil.isNotEmpty(trade.getPayStatus())
-                && trade.getPayStatus().equals(PayStatusEnum.PAID.name())) {
+            && trade.getPayStatus().equals(PayStatusEnum.PAID.name())) {
             return trade.getFlowPrice();
         }
         return order.getFlowPrice();
@@ -782,12 +797,12 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
                 //如果未开启虚拟成团且已参团人数小于成团人数，则自动取消订单
                 String reason = "拼团活动结束订单未付款，系统自动取消订单";
                 if (CharSequenceUtil.isNotEmpty(entry.getKey())) {
-                    this.systemCancel(entry.getKey(), reason,true);
+                    this.systemCancel(entry.getKey(), reason, true);
                 } else {
                     for (Order order : entry.getValue()) {
                         if (!CharSequenceUtil.equalsAny(order.getOrderStatus(), OrderStatusEnum.COMPLETED.name(), OrderStatusEnum.DELIVERED.name(),
                                 OrderStatusEnum.TAKE.name(), OrderStatusEnum.STAY_PICKED_UP.name())) {
-                            this.systemCancel(order.getSn(), reason,true);
+                            this.systemCancel(order.getSn(), reason, true);
                         }
                     }
                 }
@@ -841,7 +856,9 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
                     orderPackageItem.setGoodsName(orderItem.getGoodsName());
                     orderPackageItem.setThumbnail(orderItem.getImage());
                     orderPackageItemService.save(orderPackageItem);
-                    OrderLog orderLog = new OrderLog(orderSn, UserContext.getCurrentUser().getId(), UserContext.getCurrentUser().getRole().getRole(), UserContext.getCurrentUser().getUsername(), "订单 [ " + orderSn + " ]商品 [ " + orderItem.getGoodsName() + " ]发货，发货数量: [ " + partDeliveryDTO.getDeliveryNum() + " ]，发货单号[ " + invoiceNumber + " ]");
+                    OrderLog orderLog = new OrderLog(orderSn, UserContext.getCurrentUser().getId(),
+                            UserContext.getCurrentUser().getRole().getRole(), UserContext.getCurrentUser().getUsername(), "订单 [ " + orderSn + " ]商品" +
+                                                                                                                          " [ " + orderItem.getGoodsName() + " ]发货，发货数量: [ " + partDeliveryDTO.getDeliveryNum() + " ]，发货单号[ " + invoiceNumber + " ]");
                     orderLogList.add(orderLog);
                 }
             }
@@ -866,6 +883,14 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         return order;
     }
 
+    @Override
+    public Order updateSellerRemark(String orderSn, String sellerRemark) {
+        Order order = this.getBySn(orderSn);
+        order.setSellerRemark(sellerRemark);
+        this.updateById(order);
+        return order;
+    }
+
     /**
      * 虚拟成团
      *
@@ -880,7 +905,7 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         //未付款订单自动取消
         if (unpaidOrders != null && !unpaidOrders.isEmpty()) {
             for (Order unpaidOrder : unpaidOrders) {
-                this.systemCancel(unpaidOrder.getSn(), "拼团活动结束订单未付款，系统自动取消订单",false);
+                this.systemCancel(unpaidOrder.getSn(), "拼团活动结束订单未付款，系统自动取消订单", false);
             }
         }
         List<Order> paidOrders = listMap.get(PayStatusEnum.PAID.name());
@@ -1037,12 +1062,13 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
     /**
      * 根据提供的拼团订单列表更新拼团状态为拼团失败
      *
-     * @param list 需要更新拼团状态为失败的拼团订单列表
+     * @param parentOrderSn 拼团订单sn
      */
-    private void pintuanOrderFailed(List<Order> list) {
+    private void pintuanOrderFailed(String parentOrderSn) {
+        List<Order> list = this.list(new LambdaQueryWrapper<Order>().eq(Order::getParentOrderSn, parentOrderSn).or().eq(Order::getSn, parentOrderSn));
         for (Order order : list) {
             try {
-                this.systemCancel(order.getSn(), "拼团人数不足，拼团失败！",true);
+                this.systemCancel(order.getSn(), "拼团人数不足，拼团失败！", true);
             } catch (Exception e) {
                 log.error("拼团订单取消失败", e);
             }
@@ -1135,5 +1161,28 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         if (!verificationCode.equals(order.getVerificationCode())) {
             throw new ServiceException(ResultCode.ORDER_TAKE_ERROR);
         }
+    }
+
+    /**
+     * 根据订单设置修改订单投诉状态
+     *
+     * @param orderSn
+     */
+    private void updateOrderComplainStatus(String orderSn) {
+        Setting setting = settingService.get(SettingEnum.ORDER_SETTING.name());
+        //订单设置
+        OrderSetting orderSetting = JSONUtil.toBean(setting.getSettingValue(), OrderSetting.class);
+        if (orderSetting == null) {
+            return;
+        }
+        //设置投诉天数大于0 则走每日定时任务处理，=0 则即可关闭订单的投诉状态
+        if (orderSetting.getCloseComplaint() > 0) {
+            return;
+        }
+        //关闭订单投诉状态
+        LambdaUpdateWrapper<OrderItem> lambdaUpdateWrapper = new LambdaUpdateWrapper<OrderItem>()
+                .eq(OrderItem::getOrderSn, orderSn)
+                .set(OrderItem::getComplainStatus, OrderComplaintStatusEnum.EXPIRED.name());
+        orderItemService.update(lambdaUpdateWrapper);
     }
 }
